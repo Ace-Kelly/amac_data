@@ -2,13 +2,16 @@
 
 这是一个用于抓取中国证券投资基金业协会（AMAC）公开信息的 Python 爬虫，面向 CVC 研究里的基金识别与交叉验证场景。
 
-当前脚本支持抓取 5 张公开表，默认按数据量由小到大执行：
+当前脚本已注册 6 张公开表，默认按数据量由小到大执行：
 
 - 基金公司私募投资基金
 - 证券公司直投基金
 - 证券公司私募投资基金
 - 私募基金管理人
+- 基金公司及子公司集合资管产品
 - 私募基金产品（最大表，最后执行）
+
+这 6 张表是当前已经完成接口与详情结构验证的表，不代表 AMAC 全站只有 6 张表。程序采用注册式配置，共享分页、详情抓取、事务和断点引擎；后续可按 AMAC 不同接口模板继续扩展。
 
 ## 数据来源
 
@@ -42,13 +45,27 @@ python amac_crawler.py --list-tables
 python amac_crawler.py --smoke-test "私募基金管理人"
 ```
 
-3. 抓取全部 5 张表：
+3. 抓取全部已注册表：
 
 ```bash
 python amac_crawler.py
 ```
 
-4. 指定输出目录：
+4. 只抓一张表：
+
+```bash
+python amac_crawler.py --table "基金公司及子公司集合资管产品"
+```
+
+5. 按指定顺序抓多张表（重复使用 `--table`）：
+
+```bash
+python amac_crawler.py \
+  --table "基金公司私募投资基金" \
+  --table "基金公司及子公司集合资管产品"
+```
+
+6. 指定输出目录：
 
 ```bash
 python amac_crawler.py --output-dir ./output
@@ -100,6 +117,7 @@ python amac_crawler.py --repair-all
 - `amac_证券公司私募投资基金.csv`
 - `amac_证券公司直投基金.csv`
 - `amac_基金公司私募投资基金.csv`
+- `amac_基金公司及子公司集合资管产品.csv`
 
 ## 仓库说明
 

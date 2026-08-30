@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from amac_crawler import AMACCrawler
+from amac_crawler import AMACCrawler, TABLE_CONFIGS, build_parser
 
 
 DETAIL_HTML = """
@@ -107,6 +107,33 @@ class FullFieldTests(unittest.TestCase):
         self.assertEqual(row[1], 1)
         self.assertEqual(merged["基金类型"], "创业投资基金")
         self.assertEqual(merged["币种"], "人民币")
+
+    def test_fund_account_table_is_registered_for_full_detail_capture(self):
+        config = TABLE_CONFIGS["基金公司及子公司集合资管产品"]
+        self.assertEqual(
+            config["api_url"],
+            "https://gs.amac.org.cn/amac-infodisc/api/fund/account",
+        )
+        self.assertEqual(
+            config["detail_base"],
+            "https://gs.amac.org.cn/amac-infodisc/res/fund/account/",
+        )
+        self.assertEqual(config["unique_keys"][0], "registerCode")
+
+    def test_table_option_can_select_one_or_more_registered_tables(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--table",
+                "基金公司私募投资基金",
+                "--table",
+                "基金公司及子公司集合资管产品",
+            ]
+        )
+        self.assertEqual(
+            args.tables,
+            ["基金公司私募投资基金", "基金公司及子公司集合资管产品"],
+        )
 
 
 if __name__ == "__main__":

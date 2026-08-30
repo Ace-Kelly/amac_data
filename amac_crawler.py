@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 AMAC（中国证券投资基金业协会）数据爬虫
-按数据量由小到大爬取5张表：
+按数据量由小到大爬取已注册的公开表：
 1. 基金公司私募投资基金 (pof/pubfund)
 2. 证券公司直投基金 (aoin/product)
 3. 证券公司私募投资基金 (pof/subfund)
 4. 私募基金管理人 (pof/manager)
-5. 私募基金产品 (pof/fund)
+5. 基金公司及子公司集合资管产品 (fund/account)
+6. 私募基金产品 (pof/fund)
 """
 
 import argparse
@@ -46,7 +47,7 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# 英文字段名 → 中文表头映射（覆盖所有5张表的全部字段）
+# 通用英文字段名 → 中文表头映射；表级差异可由配置中的 field_map 覆盖。
 FIELD_CN_MAP = {
     # 私募基金产品
     "id": "ID",
@@ -110,9 +111,11 @@ FIELD_CN_MAP = {
     "primaryInvestType": "主要投资类型",
     "fundTypeScaleMap": "基金类型规模",
     "memberType": "会员类型",
+    "registerCode": "产品编码",
+    "manager": "管理人名称",
 }
 
-# 5张表的配置（字段从API响应动态获取，不再硬编码）
+# 注册式表配置。抓取引擎保持统一，接口或字段差异在每张表的配置中声明。
 TABLE_CONFIGS = {
     "私募基金产品": {
         "api_url": "https://gs.amac.org.cn/amac-infodisc/api/pof/fund",
@@ -142,6 +145,18 @@ TABLE_CONFIGS = {
         "output_file": "amac_基金公司私募投资基金.csv",
         "unique_keys": ["productCode", "productId", "id"],
     },
+    "基金公司及子公司集合资管产品": {
+        "api_url": "https://gs.amac.org.cn/amac-infodisc/api/fund/account",
+        "referer": "https://gs.amac.org.cn/amac-infodisc/res/fund/account/index.html",
+        "detail_base": "https://gs.amac.org.cn/amac-infodisc/res/fund/account/",
+        "output_file": "amac_基金公司及子公司集合资管产品.csv",
+        "unique_keys": ["registerCode", "id"],
+        "field_map": {
+            "name": "产品名称",
+            "registerCode": "产品编码",
+            "manager": "管理人名称",
+        },
+    },
     "私募基金管理人": {
         "api_url": "https://gs.amac.org.cn/amac-infodisc/api/pof/manager",
         "referer": "https://gs.amac.org.cn/amac-infodisc/res/pof/manager/index.html",
@@ -150,6 +165,15 @@ TABLE_CONFIGS = {
         "unique_keys": ["registerNo", "managerName", "id"],
     },
 }
+
+DEFAULT_TABLE_ORDER = [
+    "基金公司私募投资基金",
+    "证券公司直投基金",
+    "证券公司私募投资基金",
+    "私募基金管理人",
+    "基金公司及子公司集合资管产品",
+    "私募基金产品",
+]
 
 
 # ============== 爬虫核心 ==============
@@ -274,11 +298,13 @@ class AMACCrawler:
             raw += ".html"
         return config["detail_base"] + raw
 
-    def merge_full_record(self, list_item, detail_fields):
+    def merge_full_record(self, list_item, detail_fields, field_map=None):
         """保留 API 与详情页全部字段；重名详情字段加来源前缀。"""
+        effective_field_map = dict(FIELD_CN_MAP)
+        effective_field_map.update(field_map or {})
         merged = {}
         for raw_name, value in list_item.items():
-            header = FIELD_CN_MAP.get(raw_name, raw_name)
+            header = effective_field_map.get(raw_name, raw_name)
             if header in merged:
                 header = f"列表_{raw_name}"
             value = self._normalize_date_value(raw_name, value)
@@ -364,7 +390,9 @@ class AMACCrawler:
                         raise RuntimeError(
                             f"{table_name} 第 {page + 1} 页记录缺少唯一键"
                         )
-                    merged = self.merge_full_record(item, detail)
+                    merged = self.merge_full_record(
+                        item, detail, config.get("field_map")
+                    )
                     pending.append(
                         (
                             table_name,
@@ -610,6 +638,13 @@ def build_parser():
         help="列出支持抓取的表名后退出",
     )
     parser.add_argument(
+        "--table",
+        dest="tables",
+        action="append",
+        choices=DEFAULT_TABLE_ORDER,
+        help="只抓取指定表；可重复传入以按给定顺序抓取多张表",
+    )
+    parser.add_argument(
         "--resume",
         nargs=2,
         metavar=("TABLE", "PAGE"),
@@ -641,32 +676,27 @@ def main():
 
     使用方式:
         1. 直接运行: python amac_crawler.py
-           -> 默认爬取全部5张表
-        2. 断点续爬: python amac_crawler.py --resume 私募基金产品 8750
+           -> 默认爬取全部已注册表
+        2. 选择表: python amac_crawler.py --table 基金公司私募投资基金
+           -> 只抓指定表；可重复使用 --table 选择多张
+        3. 断点续爬: python amac_crawler.py --resume 私募基金产品 8750
            -> 从第8750页继续爬取指定表，然后继续后续表
-        3. 自动补漏: python amac_crawler.py --repair 私募基金产品
-           -> 读取现有CSV并按唯一键自动补漏、去重
-        4. 全部补漏: python amac_crawler.py --repair-all
-           -> 对5张表按顺序执行自动补漏
+        4. 自动补漏: python amac_crawler.py --repair 私募基金产品
+           -> 读取断点数据库，跳过已完整页面并继续抓取
+        5. 全部补漏: python amac_crawler.py --repair-all
+           -> 对全部已注册表按顺序执行完整字段抓取
     """
     parser = build_parser()
     args = parser.parse_args()
 
-    # 全部表（按顺序）
-    # 小表优先，先尽快形成可完整验收的成果；最大表放在最后。
-    all_tables = [
-        "基金公司私募投资基金",
-        "证券公司直投基金",
-        "证券公司私募投资基金",
-        "私募基金管理人",
-        "私募基金产品",
-    ]
+    # 全部表默认小表优先；--table 可选择一张或按给定顺序选择多张。
+    all_tables = list(args.tables or DEFAULT_TABLE_ORDER)
 
     crawler = AMACCrawler(output_dir=args.output_dir)
 
     if args.list_tables:
         print("支持的表名:")
-        for table_name in all_tables:
+        for table_name in DEFAULT_TABLE_ORDER:
             print(f"- {table_name}")
         return 0
 
