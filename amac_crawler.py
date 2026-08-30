@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 AMAC（中国证券投资基金业协会）数据爬虫
-爬取5张表：
-1. 私募基金产品 (pof/fund)
+按数据量由小到大爬取5张表：
+1. 基金公司私募投资基金 (pof/pubfund)
 2. 证券公司直投基金 (aoin/product)
 3. 证券公司私募投资基金 (pof/subfund)
-4. 基金公司私募投资基金 (pof/pubfund)
-5. 私募基金管理人 (pof/manager)
+4. 私募基金管理人 (pof/manager)
+5. 私募基金产品 (pof/fund)
 """
 
 import argparse
@@ -653,12 +653,13 @@ def main():
     args = parser.parse_args()
 
     # 全部表（按顺序）
+    # 小表优先，先尽快形成可完整验收的成果；最大表放在最后。
     all_tables = [
-        "私募基金产品",
+        "基金公司私募投资基金",
         "证券公司直投基金",
         "证券公司私募投资基金",
-        "基金公司私募投资基金",
         "私募基金管理人",
+        "私募基金产品",
     ]
 
     crawler = AMACCrawler(output_dir=args.output_dir)
