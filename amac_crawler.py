@@ -14,6 +14,8 @@ import csv
 import json
 import os
 import random
+import re
+import sqlite3
 import time
 from datetime import datetime
 from urllib.parse import urlparse
@@ -158,8 +160,254 @@ class AMACCrawler:
     def __init__(self, output_dir=DEFAULT_OUTPUT_DIR):
         self.output_dir = os.path.abspath(output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
+        self.database_path = os.path.join(
+            self.output_dir, "amac_full_fields.sqlite3"
+        )
         self.session = requests.Session()
         self._warmed_referers = set()
+
+    def _open_full_fields_db(self):
+        """打开断点数据库，并确保完整记录与页状态表存在。"""
+        db = sqlite3.connect(self.database_path)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS records (
+                table_name TEXT NOT NULL,
+                record_key TEXT NOT NULL,
+                source_page INTEGER NOT NULL,
+                detail_url TEXT NOT NULL,
+                list_json TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                merged_json TEXT NOT NULL,
+                detail_complete INTEGER NOT NULL CHECK(detail_complete = 1),
+                captured_at TEXT NOT NULL,
+                PRIMARY KEY (table_name, record_key)
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS page_state (
+                table_name TEXT NOT NULL,
+                page_number INTEGER NOT NULL,
+                record_count INTEGER NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (table_name, page_number)
+            )
+            """
+        )
+        db.commit()
+        return db
+
+    @staticmethod
+    def _clean_text(value):
+        return re.sub(r"\s+", " ", value or "").strip()
+
+    def parse_detail_fields(self, html_text):
+        """动态提取详情页全部结构化标题/值，不写死字段名。"""
+        root = etree.HTML(html_text)
+        if root is None:
+            return {}
+        result = {}
+        for title_node in root.xpath('//td[contains(concat(" ", normalize-space(@class), " "), " title ")]'):
+            label = self._clean_text(title_node.xpath("string(.)"))
+            label = re.sub(r"[：:]\s*$", "", label)
+            values = title_node.xpath("following-sibling::td[1]")
+            if not label or not values:
+                continue
+            value = self._clean_text(values[0].xpath("string(.)"))
+            if label in result and value and value not in result[label].split(" | "):
+                result[label] = f"{result[label]} | {value}" if result[label] else value
+            elif label not in result:
+                result[label] = value
+        detail_table_number = 0
+        for table in root.xpath("//table"):
+            if table.xpath('.//td[contains(concat(" ", normalize-space(@class), " "), " title ")]'):
+                continue
+            rows = []
+            for tr in table.xpath(".//tr"):
+                cells = [
+                    self._clean_text(cell.xpath("string(.)"))
+                    for cell in tr.xpath("./th|./td")
+                ]
+                if any(cells):
+                    rows.append(cells)
+            if rows:
+                detail_table_number += 1
+                result[f"详情表_{detail_table_number}"] = json.dumps(
+                    rows, ensure_ascii=False
+                )
+        return result
+
+    def fetch_detail_fields(self, detail_url, referer):
+        """带重试读取详情；失败返回 None，禁止把不完整记录写入数据库。"""
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": referer,
+            "User-Agent": USER_AGENT,
+        }
+        for retry_idx in range(MAX_RETRIES):
+            try:
+                resp = self.session.get(detail_url, headers=headers, timeout=30)
+                resp.raise_for_status()
+                resp.encoding = "utf-8"
+                fields = self.parse_detail_fields(resp.text)
+                if not fields:
+                    raise ValueError("详情页未解析出结构化字段")
+                return fields
+            except Exception as exc:
+                if retry_idx == MAX_RETRIES - 1:
+                    print(f"  [错误] 详情页失败 {detail_url}: {exc}")
+                    return None
+                self._retry_delay(retry_idx)
+
+    def _build_detail_url(self, item, config):
+        raw = item.get("url") or item.get("productId") or item.get("id")
+        if raw in (None, ""):
+            return ""
+        raw = str(raw)
+        if raw.startswith(("http://", "https://")):
+            return raw
+        if not raw.endswith(".html"):
+            raw += ".html"
+        return config["detail_base"] + raw
+
+    def merge_full_record(self, list_item, detail_fields):
+        """保留 API 与详情页全部字段；重名详情字段加来源前缀。"""
+        merged = {}
+        for raw_name, value in list_item.items():
+            header = FIELD_CN_MAP.get(raw_name, raw_name)
+            if header in merged:
+                header = f"列表_{raw_name}"
+            value = self._normalize_date_value(raw_name, value)
+            if isinstance(value, (list, dict)):
+                value = json.dumps(value, ensure_ascii=False)
+            merged[header] = "" if value is None else value
+        for label, value in detail_fields.items():
+            header = label if label not in merged else f"详情_{label}"
+            merged[header] = value
+        return merged
+
+    def _export_full_fields_csv(self, db, table_name, output_file):
+        """从完整记录库导出字段并集；数据库才是断点与完整性真源。"""
+        fields = []
+        seen = set()
+        query = (
+            "SELECT merged_json FROM records WHERE table_name=? "
+            "ORDER BY source_page, record_key"
+        )
+        record_count = 0
+        for row in db.execute(query, (table_name,)):
+            record = json.loads(row[0])
+            record_count += 1
+            for field in record:
+                if field not in seen:
+                    seen.add(field)
+                    fields.append(field)
+        if record_count == 0:
+            return
+        tmp_file = output_file + ".tmp"
+        with open(tmp_file, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for row in db.execute(query, (table_name,)):
+                writer.writerow(json.loads(row[0]))
+        os.replace(tmp_file, output_file)
+
+    def crawl_table_full_fields(self, table_name, config, start_page=0, max_pages=None):
+        """列表与详情同轮合并；整页全部成功后才以单事务落库。"""
+        print(f"\n{'=' * 60}\n全字段抓取: {table_name}\n{'=' * 60}")
+        first_data = self.fetch_list_page(config["api_url"], config["referer"], 0)
+        if first_data is None:
+            raise RuntimeError(f"{table_name} 列表接口请求失败")
+        total_pages = first_data.get("totalPages", 0)
+        total_elements = first_data.get("totalElements", 0)
+        stop_page = total_pages
+        if max_pages is not None:
+            stop_page = min(stop_page, start_page + max_pages)
+        print(f"  总记录数: {total_elements}, 总页数: {total_pages}")
+
+        db = self._open_full_fields_db()
+        output_file = os.path.join(self.output_dir, config["output_file"])
+        try:
+            for page in range(start_page, stop_page):
+                done = db.execute(
+                    "SELECT 1 FROM page_state WHERE table_name=? AND page_number=?",
+                    (table_name, page),
+                ).fetchone()
+                if done:
+                    print(f"  第 {page + 1}/{total_pages} 页已完整入库，跳过")
+                    continue
+                data = first_data if page == 0 else self.fetch_list_page(
+                    config["api_url"], config["referer"], page
+                )
+                if data is None:
+                    raise RuntimeError(f"{table_name} 第 {page + 1} 页列表失败")
+                pending = []
+                for item in data.get("content", []):
+                    detail_url = self._build_detail_url(item, config)
+                    if not detail_url:
+                        raise RuntimeError(
+                            f"{table_name} 第 {page + 1} 页记录缺少详情标识"
+                        )
+                    detail = self.fetch_detail_fields(detail_url, config["referer"])
+                    if detail is None:
+                        raise RuntimeError(
+                            f"{table_name} 第 {page + 1} 页存在详情失败，整页未入库"
+                        )
+                    record_key = self._extract_key_from_item(
+                        item, config.get("unique_keys", ["id"])
+                    )
+                    if not record_key:
+                        raise RuntimeError(
+                            f"{table_name} 第 {page + 1} 页记录缺少唯一键"
+                        )
+                    merged = self.merge_full_record(item, detail)
+                    pending.append(
+                        (
+                            table_name,
+                            record_key,
+                            page,
+                            detail_url,
+                            json.dumps(item, ensure_ascii=False),
+                            json.dumps(detail, ensure_ascii=False),
+                            json.dumps(merged, ensure_ascii=False),
+                            1,
+                            datetime.now().isoformat(timespec="seconds"),
+                        )
+                    )
+                    self._delay()
+                with db:
+                    db.executemany(
+                        """
+                        INSERT OR REPLACE INTO records
+                        (table_name, record_key, source_page, detail_url, list_json,
+                         detail_json, merged_json, detail_complete, captured_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        pending,
+                    )
+                    db.execute(
+                        """
+                        INSERT OR REPLACE INTO page_state
+                        (table_name, page_number, record_count, completed_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            table_name,
+                            page,
+                            len(pending),
+                            datetime.now().isoformat(timespec="seconds"),
+                        ),
+                    )
+                print(f"  第 {page + 1}/{total_pages} 页完整入库: {len(pending)} 条")
+                if (page + 1) % 50 == 0 or page == stop_page - 1:
+                    self._export_full_fields_csv(db, table_name, output_file)
+            self._export_full_fields_csv(db, table_name, output_file)
+        finally:
+            db.close()
 
     def _get_headers(self, referer):
         return {
@@ -299,117 +547,6 @@ class AMACCrawler:
         print(f"  总记录数: {total_elements}, 总页数: {total_pages}")
         return total_pages, total_elements
 
-    def _item_to_row(self, item, fields):
-        """将API返回的一条记录按字段列表转为行数据，自动转换日期"""
-        row = []
-        for field in fields:
-            val = item.get(field, "")
-            val = self._normalize_date_value(field, val)
-            if val is None:
-                val = ""
-            # list/dict 转 JSON 字符串
-            if isinstance(val, (list, dict)):
-                val = json.dumps(val, ensure_ascii=False)
-            row.append(val)
-        return row
-
-    def crawl_table(self, table_name, config, start_page=0):
-        """
-        爬取一张表的全部数据，动态保存API返回的全部字段
-        start_page: 断点续爬起始页（0-based），默认从头开始
-        """
-        print(f"\n{'='*60}")
-        print(f"开始爬取: {table_name}")
-        if start_page > 0:
-            print(f"  [断点续爬] 从第 {start_page + 1} 页开始")
-        print(f"{'='*60}")
-
-        api_url = config["api_url"]
-        referer = config["referer"]
-        output_file = os.path.join(self.output_dir, config["output_file"])
-
-        # 先请求第0页，获取总页数和字段名
-        first_data = self.fetch_list_page(api_url, referer, page=0)
-        if first_data is None:
-            print(f"  [跳过] {table_name} 请求失败")
-            return
-
-        total_elements = first_data.get("totalElements", 0)
-        total_pages = first_data.get("totalPages", 0)
-        print(f"  总记录数: {total_elements}, 总页数: {total_pages}")
-
-        if total_pages == 0:
-            print(f"  [跳过] {table_name} 没有数据")
-            return
-
-        # 从第一条记录动态获取所有字段名作为CSV表头
-        first_content = first_data.get("content", [])
-        if not first_content:
-            print(f"  [跳过] {table_name} 第一页无内容")
-            return
-        fields = list(first_content[0].keys())
-        print(f"  字段: {fields}")
-
-        rows = []
-        failed_pages = []
-
-        # 断点续爬：读取已有CSV数据
-        if start_page > 0 and os.path.exists(output_file):
-            with open(output_file, "r", encoding="utf-8-sig") as f:
-                reader = csv.reader(f)
-                next(reader)  # 跳过表头
-                for r in reader:
-                    rows.append(r)
-            print(f"  已加载已有数据 {len(rows)} 条")
-        else:
-            # 第0页已经拿到了，先处理
-            for item in first_content:
-                rows.append(self._item_to_row(item, fields))
-
-        actual_start = max(start_page, 1)
-        for page in range(actual_start, total_pages):
-            print(f"  第 {page+1}/{total_pages} 页...")
-            data = self.fetch_list_page(api_url, referer, page)
-
-            if data is None:
-                failed_pages.append(page)
-                self._delay()
-                continue
-
-            for item in data.get("content", []):
-                rows.append(self._item_to_row(item, fields))
-
-            # 每50页保存一次
-            if (page + 1) % 50 == 0 or page == total_pages - 1:
-                self._save_csv(output_file, fields, rows)
-                print(f"  已保存 {len(rows)} 条记录到 {config['output_file']}")
-
-            self._delay()
-
-        # 最终保存
-        self._save_csv(output_file, fields, rows)
-        print(f"\n  [完成] {table_name}: 共 {len(rows)} 条记录")
-        if failed_pages:
-            print(f"  [警告] 失败页: {failed_pages}")
-
-        # 重试失败的页
-        if failed_pages:
-            print(f"  正在重试 {len(failed_pages)} 个失败页...")
-            for page in failed_pages:
-                time.sleep(3)
-                data = self.fetch_list_page(api_url, referer, page)
-                if data is None:
-                    print(f"    第{page}页重试仍然失败")
-                    continue
-                for item in data.get("content", []):
-                    rows.append(self._item_to_row(item, fields))
-            self._save_csv(output_file, fields, rows)
-            print(f"  重试完成，最终共 {len(rows)} 条记录")
-
-    def _translate_header(self, fields):
-        """将英文字段名转为中文表头"""
-        return [FIELD_CN_MAP.get(f, f) for f in fields]
-
     def _normalize_key(self, val):
         if val in ("", None):
             return ""
@@ -421,129 +558,6 @@ class AMACCrawler:
             if v:
                 return v
         return ""
-
-    def _extract_key_from_row(self, row, fields, key_fields):
-        for k in key_fields:
-            if k not in fields:
-                continue
-            idx = fields.index(k)
-            if idx >= len(row):
-                continue
-            v = self._normalize_key(row[idx])
-            if v:
-                return v
-        return ""
-
-    def repair_table(self, table_name, config):
-        """
-        自动补漏模式：
-        1) 读取现有CSV
-        2) 基于唯一键去重
-        3) 全页扫描接口，仅补缺失记录
-        """
-        print(f"\n{'='*60}")
-        print(f"自动补漏: {table_name}")
-        print(f"{'='*60}")
-
-        api_url = config["api_url"]
-        referer = config["referer"]
-        output_file = os.path.join(self.output_dir, config["output_file"])
-        key_fields = config.get("unique_keys", ["id"])
-
-        first_data = self.fetch_list_page(api_url, referer, page=0)
-        if first_data is None:
-            print(f"  [跳过] {table_name} 请求失败")
-            return
-
-        total_elements = first_data.get("totalElements", 0)
-        total_pages = first_data.get("totalPages", 0)
-        print(f"  接口总记录数: {total_elements}, 总页数: {total_pages}")
-        if total_pages == 0:
-            print(f"  [跳过] {table_name} 没有数据")
-            return
-
-        first_content = first_data.get("content", [])
-        if not first_content:
-            print(f"  [跳过] {table_name} 第一页无内容")
-            return
-        fields = list(first_content[0].keys())
-
-        existing_rows = []
-        existing_keys = set()
-
-        if os.path.exists(output_file):
-            with open(output_file, "r", encoding="utf-8-sig") as f:
-                reader = csv.reader(f)
-                next(reader, None)  # 跳过表头
-                for row in reader:
-                    key = self._extract_key_from_row(row, fields, key_fields)
-                    if key and key in existing_keys:
-                        continue
-                    if key:
-                        existing_keys.add(key)
-                    existing_rows.append(row)
-        else:
-            print("  [提示] 未找到历史CSV，将执行全量抓取并保存。")
-
-        print(f"  本地已有记录(去重后): {len(existing_rows)}")
-
-        added_rows = []
-        failed_pages = []
-
-        for page in range(total_pages):
-            print(f"  扫描第 {page+1}/{total_pages} 页...")
-            data = self.fetch_list_page(api_url, referer, page)
-            if data is None:
-                failed_pages.append(page)
-                self._delay()
-                continue
-
-            for item in data.get("content", []):
-                key = self._extract_key_from_item(item, key_fields)
-                if key and key in existing_keys:
-                    continue
-                row = self._item_to_row(item, fields)
-                added_rows.append(row)
-                if key:
-                    existing_keys.add(key)
-
-            self._delay()
-
-        if failed_pages:
-            print(f"  重试失败页: {failed_pages}")
-            for page in failed_pages:
-                time.sleep(3)
-                data = self.fetch_list_page(api_url, referer, page)
-                if data is None:
-                    print(f"    第{page}页重试仍失败")
-                    continue
-                for item in data.get("content", []):
-                    key = self._extract_key_from_item(item, key_fields)
-                    if key and key in existing_keys:
-                        continue
-                    row = self._item_to_row(item, fields)
-                    added_rows.append(row)
-                    if key:
-                        existing_keys.add(key)
-
-        final_rows = existing_rows + added_rows
-        self._save_csv(output_file, fields, final_rows)
-
-        print(f"  新增补漏记录: {len(added_rows)}")
-        print(f"  补漏后总记录: {len(final_rows)}")
-        if len(final_rows) < total_elements:
-            print(f"  [提示] 仍少于接口总记录数，可能仍有页抓取失败或接口数据在变动。")
-        else:
-            print("  [完成] 补漏完成。")
-
-    def _save_csv(self, filepath, fields, rows):
-        """保存数据到CSV，表头使用中文，分批写入避免OSError"""
-        BATCH = 5000
-        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(self._translate_header(fields))
-            for i in range(0, len(rows), BATCH):
-                writer.writerows(rows[i:i + BATCH])
 
     def smoke_test_table(self, table_name, config):
         """请求单张表第一页，验证接口连通性与字段解析是否正常"""
@@ -687,7 +701,7 @@ def main():
             print(f"[错误] 不支持的表名: {repair_table}")
             print(f"可选表名: {list(TABLE_CONFIGS.keys())}")
             return 1
-        crawler.repair_table(repair_table, TABLE_CONFIGS[repair_table])
+        crawler.crawl_table_full_fields(repair_table, TABLE_CONFIGS[repair_table])
         print(f"\n{'='*60}")
         print(f"补漏完成! 结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"输出目录: {crawler.output_dir}")
@@ -698,7 +712,7 @@ def main():
         for table_name in all_tables:
             if table_name not in TABLE_CONFIGS:
                 continue
-            crawler.repair_table(table_name, TABLE_CONFIGS[table_name])
+            crawler.crawl_table_full_fields(table_name, TABLE_CONFIGS[table_name])
         print(f"\n{'='*60}")
         print(f"全部补漏完成! 结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"输出目录: {crawler.output_dir}")
@@ -713,13 +727,15 @@ def main():
             if table_name == resume_table:
                 started = True
                 config = TABLE_CONFIGS[table_name]
-                crawler.crawl_table(table_name, config, start_page=resume_page)
+                crawler.crawl_table_full_fields(
+                    table_name, config, start_page=resume_page
+                )
                 continue
             else:
                 print(f"  [跳过] {table_name}（断点续爬，跳到 {resume_table}）")
                 continue
         config = TABLE_CONFIGS[table_name]
-        crawler.crawl_table(table_name, config)
+        crawler.crawl_table_full_fields(table_name, config)
 
     print(f"\n{'='*60}")
     print(f"全部完成! 结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
